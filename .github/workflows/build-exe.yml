@@ -46,19 +46,19 @@ jobs:
         copy README.md release\ 2>nul || echo "README.md not found, skipping"
     
     - name: Upload Console Executable
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: popup-blocker-console
         path: dist/popup_blocker_console.exe
     
     - name: Upload GUI Executable
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: popup-blocker-gui
         path: dist/popup_blocker_gui.exe
     
     - name: Upload Complete Release
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: popup-blocker-complete
         path: release/
