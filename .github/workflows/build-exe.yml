@@ -1,0 +1,74 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+    
+    - name: Build Console Version
+      run: |
+        pyinstaller --onefile --console --name popup_blocker_console popup_blocker.py
+    
+    - name: Build GUI Version
+      run: |
+        pyinstaller --onefile --windowed --name popup_blocker_gui gui_popup_blocker.py
+    
+    - name: Create release folder
+      run: |
+        mkdir release
+        copy dist\popup_blocker_console.exe release\
+        copy dist\popup_blocker_gui.exe release\
+        copy run.bat release\
+        copy run_gui.bat release\
+        copy config.py release\
+        copy logger.py release\
+        copy window_detector.py release\
+        copy README.md release\ 2>nul || echo "README.md not found, skipping"
+    
+    - name: Upload Console Executable
+      uses: actions/upload-artifact@v3
+      with:
+        name: popup-blocker-console
+        path: dist/popup_blocker_console.exe
+    
+    - name: Upload GUI Executable
+      uses: actions/upload-artifact@v3
+      with:
+        name: popup-blocker-gui
+        path: dist/popup_blocker_gui.exe
+    
+    - name: Upload Complete Release
+      uses: actions/upload-artifact@v3
+      with:
+        name: popup-blocker-complete
+        path: release/
+    
+    - name: Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          dist/popup_blocker_console.exe
+          dist/popup_blocker_gui.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
