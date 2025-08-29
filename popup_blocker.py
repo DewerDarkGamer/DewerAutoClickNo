@@ -110,26 +110,55 @@ class PopupBlocker:
     
     def _handle_popup(self, hwnd: int, window_title: str) -> bool:
         """
-        Handle a detected popup window
+        Handle a detected popup window with retry mechanism
         Returns True if a button was successfully clicked
         """
         if not WINDOWS_AVAILABLE:
             return False
             
         try:
-            # First, try to find and click standard dialog buttons
-            if self._click_standard_dialog_button(hwnd):
-                self.logger.info(f"Clicked standard dialog button in '{window_title}'")
-                return True
+            max_retries = 3  # คลิกซ้ำสูงสุด 3 ครั้ง
             
-            # If standard approach fails, try to find buttons by text
-            button_hwnd = self.detector.find_button_by_text(hwnd, self.config.target_buttons)
-            if button_hwnd:
-                if self._click_button(button_hwnd):
-                    self.logger.info(f"Clicked 'No' button in '{window_title}'")
-                    return True
+            for attempt in range(max_retries):
+                self.logger.debug(f"Attempt {attempt + 1} to handle popup '{window_title}'")
+                
+                # First, try to find and click standard dialog buttons
+                if self._click_standard_dialog_button_with_retry(hwnd):
+                    self.logger.info(f"Clicked standard dialog button in '{window_title}' (attempt {attempt + 1})")
+                    
+                    # ตรวจสอบว่าปุ่มหายไปหรือยัง
+                    time.sleep(0.5)  # รอให้หน้าต่างประมวลผล
+                    if not self._popup_still_exists(hwnd):
+                        return True
+                    else:
+                        self.logger.debug(f"Popup still exists after standard click, retrying...")
+                        continue
+                
+                # If standard approach fails, try to find buttons by text
+                button_hwnd = self.detector.find_button_by_text(hwnd, self.config.target_buttons)
+                if button_hwnd:
+                    if self._click_button_enhanced(button_hwnd, window_title, attempt + 1):
+                        self.logger.info(f"Clicked 'No' button in '{window_title}' (attempt {attempt + 1})")
+                        
+                        # ตรวจสอบว่าปุ่มหายไปหรือยัง
+                        time.sleep(0.5)  # รอให้หน้าต่างประมวลผล
+                        if not self._popup_still_exists(hwnd):
+                            return True
+                        else:
+                            # ตรวจสอบว่าปุ่ม "no" ยังอยู่หรือไม่
+                            button_still_exists = self.detector.find_button_by_text(hwnd, self.config.target_buttons)
+                            if not button_still_exists:
+                                self.logger.info(f"No button disappeared after click")
+                                return True
+                            else:
+                                self.logger.debug(f"Button still exists, retrying...")
+                                continue
+                
+                # รอก่อนลองครั้งต่อไป
+                if attempt < max_retries - 1:
+                    time.sleep(0.3)
             
-            self.logger.warning(f"No 'No' button found in popup '{window_title}'")
+            self.logger.warning(f"Failed to handle popup '{window_title}' after {max_retries} attempts")
             return False
             
         except Exception as e:
@@ -137,61 +166,139 @@ class PopupBlocker:
             self.stats['errors'] += 1
             return False
     
-    def _click_standard_dialog_button(self, hwnd: int) -> bool:
+    def _click_button(self, button_hwnd: int) -> bool:
         """
-        Try to click standard dialog buttons (IDNO, IDCANCEL)
+        Legacy click function for backward compatibility
+        """
+        return self._click_button_enhanced(button_hwnd, "unknown", 1)
+    
+    def _click_button_enhanced(self, button_hwnd: int, window_title: str, attempt: int) -> bool:
+        """
+        Enhanced button clicking with multiple methods and better error handling
         Returns True if successful
         """
         if not WINDOWS_AVAILABLE:
             return False
             
         try:
-            # Try IDNO first (standard 'No' button)
-            result = ctypes.windll.user32.SendMessageW(hwnd, WM_COMMAND, IDNO, 0)
-            if result == 0:  # Success
-                return True
+            self.logger.debug(f"Attempting to click button (method enhanced, attempt {attempt})")
             
-            # Don't try IDCANCEL since we only want "No" buttons, not "Cancel"
+            # Method 1: Send BM_CLICK message
+            try:
+                result = ctypes.windll.user32.SendMessageW(button_hwnd, BM_CLICK, 0, 0)
+                time.sleep(0.2)  # รอให้ click ประมวลผล
+                if result is not None:  # ไม่ใช่ result == 0 เพราะอาจส่งคืนค่าอื่น
+                    self.logger.debug(f"BM_CLICK sent successfully")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"BM_CLICK failed: {e}")
+            
+            # Method 2: Enhanced mouse click simulation
+            try:
+                rect = ctypes.wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(button_hwnd, ctypes.byref(rect)):
+                    center_x = (rect.left + rect.right) // 2
+                    center_y = (rect.top + rect.bottom) // 2
+                    
+                    self.logger.debug(f"Clicking at position ({center_x}, {center_y})")
+                    
+                    # เก็บตำแหน่งเมาส์เดิม
+                    old_pos = ctypes.wintypes.POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(old_pos))
+                    
+                    # Set cursor position
+                    ctypes.windll.user32.SetCursorPos(center_x, center_y)
+                    time.sleep(0.1)
+                    
+                    # Multiple click attempts
+                    for i in range(2):  # คลิก 2 ครั้งเผื่อครั้งแรกไม่ติด
+                        # Left mouse down
+                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+                        time.sleep(0.05)
+                        # Left mouse up
+                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+                        time.sleep(0.1)
+                    
+                    # คืนตำแหน่งเมาส์เดิม
+                    ctypes.windll.user32.SetCursorPos(old_pos.x, old_pos.y)
+                    
+                    self.logger.debug(f"Mouse click completed")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Mouse click failed: {e}")
+            
+            # Method 3: Send WM_LBUTTONDOWN/UP messages directly to button
+            try:
+                ctypes.windll.user32.SendMessageW(button_hwnd, WM_LBUTTONDOWN, 1, 0)
+                time.sleep(0.05)
+                ctypes.windll.user32.SendMessageW(button_hwnd, WM_LBUTTONUP, 0, 0)
+                time.sleep(0.1)
+                self.logger.debug(f"Direct button message sent")
+                return True
+            except Exception as e:
+                self.logger.debug(f"Direct button message failed: {e}")
+            
+            # Method 4: Try PostMessage instead of SendMessage
+            try:
+                ctypes.windll.user32.PostMessageW(button_hwnd, BM_CLICK, 0, 0)
+                time.sleep(0.2)
+                self.logger.debug(f"PostMessage BM_CLICK sent")
+                return True
+            except Exception as e:
+                self.logger.debug(f"PostMessage failed: {e}")
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error in enhanced button click: {e}")
+            return False
+    
+    def _click_standard_dialog_button_with_retry(self, hwnd: int) -> bool:
+        """
+        Try to click standard dialog buttons with retry
+        Returns True if successful
+        """
+        if not WINDOWS_AVAILABLE:
+            return False
+            
+        try:
+            # Try IDNO multiple times with different methods
+            for i in range(2):
+                try:
+                    # Method 1: SendMessage
+                    result = ctypes.windll.user32.SendMessageW(hwnd, WM_COMMAND, IDNO, 0)
+                    time.sleep(0.2)
+                    if result is not None:
+                        return True
+                except Exception:
+                    pass
+                
+                try:
+                    # Method 2: PostMessage
+                    ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, IDNO, 0)
+                    time.sleep(0.2)
+                    return True
+                except Exception:
+                    pass
+            
             return False
             
         except Exception as e:
             self.logger.debug(f"Standard dialog approach failed: {e}")
             return False
     
-    def _click_button(self, button_hwnd: int) -> bool:
+    def _popup_still_exists(self, hwnd: int) -> bool:
         """
-        Click a button using Windows API
-        Returns True if successful
+        Check if popup window still exists and is visible
         """
         if not WINDOWS_AVAILABLE:
             return False
             
         try:
-            # Method 1: Send BM_CLICK message
-            result = ctypes.windll.user32.SendMessageW(button_hwnd, BM_CLICK, 0, 0)
-            if result == 0:
-                return True
-            
-            # Method 2: Simulate mouse click
-            rect = ctypes.wintypes.RECT()
-            if ctypes.windll.user32.GetWindowRect(button_hwnd, ctypes.byref(rect)):
-                center_x = (rect.left + rect.right) // 2
-                center_y = (rect.top + rect.bottom) // 2
-                
-                # Set cursor position and click
-                ctypes.windll.user32.SetCursorPos(center_x, center_y)
-                time.sleep(0.1)  # Small delay
-                
-                ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                time.sleep(0.05)
-                ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                
-                return True
-            
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Error clicking button: {e}")
+            # ตรวจสอบว่าหน้าต่างยังมองเห็นได้หรือไม่
+            return bool(ctypes.windll.user32.IsWindowVisible(hwnd) and 
+                       ctypes.windll.user32.IsWindow(hwnd))
+        except Exception:
             return False
     
     def _print_stats(self):
