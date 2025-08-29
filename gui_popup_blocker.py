@@ -1,308 +1,336 @@
 #!/usr/bin/env python3
 """
-GUI Popup Blocker - ระบบป้องกัน Popup พร้อม GUI
-สำหรับ Windows เท่านั้น
+Popup Blocker - Automatically clicks 'No' on popup notifications
+Uses built-in Windows capabilities only - no external dependencies required
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import threading
 import time
 import sys
 import os
-from datetime import datetime
+from typing import List, Tuple, Optional
+import threading
+import signal
 
-# Import our existing modules
-from config import Config
-from logger import Logger
-
-# Only import Windows-specific modules when on Windows
+# Only import Windows-specific modules when available
 try:
     import ctypes
-    from popup_blocker import PopupBlocker
+    import ctypes.wintypes
     WINDOWS_AVAILABLE = True
 except (ImportError, AttributeError):
     WINDOWS_AVAILABLE = False
 
-class MouseMover:
-    """คลาสสำหรับเลื่อนเมาส์เพื่อป้องกันการล็อคหน้าจอ"""
-    
+from config import Config
+from logger import Logger
+
+if WINDOWS_AVAILABLE:
+    from window_detector import WindowDetector
+
+# Windows API constants
+WM_COMMAND = 0x0111
+BM_CLICK = 0x00F5
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+IDNO = 7
+IDCANCEL = 2
+
+class PopupBlocker:
     def __init__(self):
+        # Check if Windows is available
+        if not WINDOWS_AVAILABLE:
+            raise RuntimeError("This program only works on Windows")
+            
+        self.config = Config()
+        self.logger = Logger()
+        self.detector = WindowDetector()
         self.running = False
-        self.thread = None
+        self.stats = {
+            'popups_detected': 0,
+            'buttons_clicked': 0,
+            'errors': 0
+        }
         
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        self.logger.info("Shutdown signal received. Stopping popup blocker...")
+        self.stop()
+        sys.exit(0)
+    
     def start(self):
-        """เริ่มการเลื่อนเมาส์"""
+        """Start the popup blocker service"""
+        if not WINDOWS_AVAILABLE:
+            self.logger.error("This program only works on Windows")
+            return
+            
+        self.logger.info("Starting Popup Blocker...")
+        self.logger.info(f"Check interval: {self.config.check_interval}s")
+        self.logger.info(f"Target button texts: {self.config.target_buttons}")
+        
+        self.running = True
+        
+        try:
+            while self.running:
+                self._check_for_popups()
+                time.sleep(self.config.check_interval)
+        except KeyboardInterrupt:
+            self.logger.info("Keyboard interrupt received")
+        except Exception as e:
+            self.logger.error(f"Unexpected error in main loop: {e}")
+            self.stats['errors'] += 1
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Stop the popup blocker service"""
+        self.running = False
+        self._print_stats()
+        self.logger.info("Popup Blocker stopped")
+    
+    def _check_for_popups(self):
+        """Check for popup windows and handle them"""
+        if not WINDOWS_AVAILABLE:
+            return
+            
+        try:
+            popup_windows = self.detector.find_popup_windows()
+            
+            for hwnd, window_title in popup_windows:
+                self.stats['popups_detected'] += 1
+                self.logger.info(f"Detected popup: '{window_title}' (HWND: {hwnd})")
+                
+                if self._handle_popup(hwnd, window_title):
+                    self.stats['buttons_clicked'] += 1
+                    
+        except Exception as e:
+            self.logger.error(f"Error checking for popups: {e}")
+            self.stats['errors'] += 1
+    
+    def _handle_popup(self, hwnd: int, window_title: str) -> bool:
+        """
+        Handle a detected popup window with retry mechanism
+        Returns True if a button was successfully clicked
+        """
         if not WINDOWS_AVAILABLE:
             return False
             
-        self.running = True
-        self.thread = threading.Thread(target=self._move_mouse_loop, daemon=True)
-        self.thread.start()
-        return True
-        
-    def stop(self):
-        """หยุดการเลื่อนเมาส์"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1)
+        try:
+            max_retries = 3  # คลิกซ้ำสูงสุด 3 ครั้ง
             
-    def _move_mouse_loop(self):
-        """วนรอบการเลื่อนเมาส์ทุก 4 นาที"""
-        try:
-            while self.running:
-                # รอ 4 นาที (240 วินาที)
-                for i in range(240):
-                    if not self.running:
-                        return
-                    time.sleep(1)
+            for attempt in range(max_retries):
+                self.logger.debug(f"Attempt {attempt + 1} to handle popup '{window_title}'")
                 
-                # เลื่อนเมาส์เล็กน้อย
-                self._nudge_mouse()
+                # First, try to find and click standard dialog buttons
+                if self._click_standard_dialog_button_with_retry(hwnd):
+                    self.logger.info(f"Clicked standard dialog button in '{window_title}' (attempt {attempt + 1})")
+                    
+                    # ตรวจสอบว่าปุ่มหายไปหรือยัง
+                    time.sleep(0.5)  # รอให้หน้าต่างประมวลผล
+                    if not self._popup_still_exists(hwnd):
+                        return True
+                    else:
+                        self.logger.debug(f"Popup still exists after standard click, retrying...")
+                        continue
                 
+                # If standard approach fails, try to find buttons by text
+                button_hwnd = self.detector.find_button_by_text(hwnd, self.config.target_buttons)
+                if button_hwnd:
+                    if self._click_button_enhanced(button_hwnd, window_title, attempt + 1):
+                        self.logger.info(f"Clicked 'No' button in '{window_title}' (attempt {attempt + 1})")
+                        
+                        # ตรวจสอบว่าปุ่มหายไปหรือยัง
+                        time.sleep(0.5)  # รอให้หน้าต่างประมวลผล
+                        if not self._popup_still_exists(hwnd):
+                            return True
+                        else:
+                            # ตรวจสอบว่าปุ่ม "no" ยังอยู่หรือไม่
+                            button_still_exists = self.detector.find_button_by_text(hwnd, self.config.target_buttons)
+                            if not button_still_exists:
+                                self.logger.info(f"No button disappeared after click")
+                                return True
+                            else:
+                                self.logger.debug(f"Button still exists, retrying...")
+                                continue
+                
+                # รอก่อนลองครั้งต่อไป
+                if attempt < max_retries - 1:
+                    time.sleep(0.3)
+            
+            self.logger.warning(f"Failed to handle popup '{window_title}' after {max_retries} attempts")
+            return False
+            
         except Exception as e:
-            print(f"Error in mouse mover: {e}")
+            self.logger.error(f"Error handling popup '{window_title}': {e}")
+            self.stats['errors'] += 1
+            return False
     
-    def _nudge_mouse(self):
-        """เลื่อนเมาส์เล็กน้อยเพื่อป้องกันการล็อคหน้าจอ"""
+    def _click_button(self, button_hwnd: int) -> bool:
+        """
+        Legacy click function for backward compatibility
+        """
+        return self._click_button_enhanced(button_hwnd, "unknown", 1)
+    
+    def _click_button_enhanced(self, button_hwnd: int, window_title: str, attempt: int) -> bool:
+        """
+        Enhanced button clicking with multiple methods and better error handling
+        Returns True if successful
+        """
+        if not WINDOWS_AVAILABLE:
+            return False
+            
         try:
-            if WINDOWS_AVAILABLE:
-                # ได้ตำแหน่งเมาส์ปัจจุบัน
-                point = ctypes.wintypes.POINT()
-                ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
-                
-                # เลื่อนเมาส์ 1 พิกเซล แล้วเลื่อนกลับ
-                ctypes.windll.user32.SetCursorPos(point.x + 1, point.y)
+            self.logger.debug(f"Attempting to click button (method enhanced, attempt {attempt})")
+            
+            # Method 1: Send BM_CLICK message
+            try:
+                result = ctypes.windll.user32.SendMessageW(button_hwnd, BM_CLICK, 0, 0)
+                time.sleep(0.2)  # รอให้ click ประมวลผล
+                if result is not None:  # ไม่ใช่ result == 0 เพราะอาจส่งคืนค่าอื่น
+                    self.logger.debug(f"BM_CLICK sent successfully")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"BM_CLICK failed: {e}")
+            
+            # Method 2: Enhanced mouse click simulation
+            try:
+                rect = ctypes.wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(button_hwnd, ctypes.byref(rect)):
+                    center_x = (rect.left + rect.right) // 2
+                    center_y = (rect.top + rect.bottom) // 2
+                    
+                    self.logger.debug(f"Clicking at position ({center_x}, {center_y})")
+                    
+                    # เก็บตำแหน่งเมาส์เดิม
+                    old_pos = ctypes.wintypes.POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(old_pos))
+                    
+                    # Set cursor position
+                    ctypes.windll.user32.SetCursorPos(center_x, center_y)
+                    time.sleep(0.1)
+                    
+                    # Multiple click attempts
+                    for i in range(2):  # คลิก 2 ครั้งเผื่อครั้งแรกไม่ติด
+                        # Left mouse down
+                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+                        time.sleep(0.05)
+                        # Left mouse up
+                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+                        time.sleep(0.1)
+                    
+                    # คืนตำแหน่งเมาส์เดิม
+                    ctypes.windll.user32.SetCursorPos(old_pos.x, old_pos.y)
+                    
+                    self.logger.debug(f"Mouse click completed")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Mouse click failed: {e}")
+            
+            # Method 3: Send WM_LBUTTONDOWN/UP messages directly to button
+            try:
+                ctypes.windll.user32.SendMessageW(button_hwnd, WM_LBUTTONDOWN, 1, 0)
+                time.sleep(0.05)
+                ctypes.windll.user32.SendMessageW(button_hwnd, WM_LBUTTONUP, 0, 0)
                 time.sleep(0.1)
-                ctypes.windll.user32.SetCursorPos(point.x, point.y)
-                
+                self.logger.debug(f"Direct button message sent")
+                return True
+            except Exception as e:
+                self.logger.debug(f"Direct button message failed: {e}")
+            
+            # Method 4: Try PostMessage instead of SendMessage
+            try:
+                ctypes.windll.user32.PostMessageW(button_hwnd, BM_CLICK, 0, 0)
+                time.sleep(0.2)
+                self.logger.debug(f"PostMessage BM_CLICK sent")
+                return True
+            except Exception as e:
+                self.logger.debug(f"PostMessage failed: {e}")
+            
+            return False
+            
         except Exception as e:
-            print(f"Error nudging mouse: {e}")
-
-class PopupBlockerGUI:
-    """GUI สำหรับ Popup Blocker"""
+            self.logger.error(f"Error in enhanced button click: {e}")
+            return False
     
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Popup Blocker - ป้องกัน Popup อัตโนมัติ")
-        self.root.geometry("500x400")
-        self.root.resizable(True, True)
-        
-        # สถานะการทำงาน
-        self.is_running = False
-        self.blocker = None
-        self.blocker_thread = None
-        self.mouse_mover = MouseMover()
-        
-        # สร้าง GUI
-        self.setup_gui()
-        
-        # ตั้งค่าปิดโปรแกรม
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-    def setup_gui(self):
-        """สร้าง GUI components"""
-        
-        # หัวเรื่อง
-        title_frame = ttk.Frame(self.root, padding="10")
-        title_frame.pack(fill=tk.X)
-        
-        title_label = ttk.Label(title_frame, text="🚫 Popup Blocker", font=("Arial", 16, "bold"))
-        title_label.pack()
-        
-        subtitle_label = ttk.Label(title_frame, text="กดปุ่ม 'ไม่' อัตโนมัติ + ป้องกันล็อคหน้าจอ")
-        subtitle_label.pack()
-        
-        # กรอบปุ่มควบคุม
-        control_frame = ttk.LabelFrame(self.root, text="ควบคุมโปรแกรม", padding="10")
-        control_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        # ปุ่มเริ่ม/หยุด
-        button_frame = ttk.Frame(control_frame)
-        button_frame.pack(fill=tk.X)
-        
-        self.start_button = ttk.Button(button_frame, text="▶️ เริ่มโปรแกรม", 
-                                      command=self.start_blocker, style="Green.TButton")
-        self.start_button.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_button = ttk.Button(button_frame, text="⏹️ หยุดโปรแกรม", 
-                                     command=self.stop_blocker, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT, padx=5)
-        
-        # สถานะ
-        self.status_var = tk.StringVar(value="พร้อมใช้งาน")
-        status_label = ttk.Label(control_frame, textvariable=self.status_var, 
-                                font=("Arial", 10, "bold"))
-        status_label.pack(pady=5)
-        
-        # กรอบตั้งค่า
-        settings_frame = ttk.LabelFrame(self.root, text="ตั้งค่า", padding="10")
-        settings_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        # เช็คบ็อกซ์ป้องกันล็อคหน้าจอ
-        self.prevent_lock_var = tk.BooleanVar(value=True)
-        prevent_lock_cb = ttk.Checkbutton(settings_frame, 
-                                         text="ป้องกันการล็อคหน้าจอ (เลื่อนเมาส์ทุก 4 นาที)",
-                                         variable=self.prevent_lock_var)
-        prevent_lock_cb.pack(anchor=tk.W)
-        
-        # กรอบสถิติ
-        stats_frame = ttk.LabelFrame(self.root, text="สถิติการทำงาน", padding="10")
-        stats_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        self.stats_text = ttk.Label(stats_frame, text="ยังไม่เริ่มทำงาน")
-        self.stats_text.pack()
-        
-        # กรอบ Log
-        log_frame = ttk.LabelFrame(self.root, text="Log การทำงาน", padding="5")
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, width=60)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        # ปุ่มล้าง Log
-        clear_button = ttk.Button(log_frame, text="ล้าง Log", command=self.clear_log)
-        clear_button.pack(pady=2)
-        
-        # เพิ่มข้อความเริ่มต้น
-        self.add_log("โปรแกรม Popup Blocker พร้อมใช้งาน")
-        self.add_log("✨ รุ่นปรับปรุง: คลิกซ้ำจนกว่าปุ่ม 'ไม่' จะหายไป")
+    def _click_standard_dialog_button_with_retry(self, hwnd: int) -> bool:
+        """
+        Try to click standard dialog buttons with retry
+        Returns True if successful
+        """
         if not WINDOWS_AVAILABLE:
-            self.add_log("⚠️ ตรวจพบว่าไม่ได้อยู่บน Windows - โปรแกรมจะไม่ทำงานได้")
-            self.start_button.config(state=tk.DISABLED)
-        else:
-            self.add_log("🎯 ปรับปรุงแล้ว: การคลิกมีประสิทธิภาพมากขึ้น")
-        
-    def add_log(self, message):
-        """เพิ่มข้อความใน log"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}\n"
-        
-        self.log_text.insert(tk.END, log_entry)
-        self.log_text.see(tk.END)  # เลื่อนไปข้อความล่าสุด
-        
-    def clear_log(self):
-        """ล้าง log"""
-        self.log_text.delete(1.0, tk.END)
-        self.add_log("ล้าง log แล้ว")
-        
-    def start_blocker(self):
-        """เริ่มโปรแกรม Popup Blocker"""
+            return False
+            
+        try:
+            # Try IDNO multiple times with different methods
+            for i in range(2):
+                try:
+                    # Method 1: SendMessage
+                    result = ctypes.windll.user32.SendMessageW(hwnd, WM_COMMAND, IDNO, 0)
+                    time.sleep(0.2)
+                    if result is not None:
+                        return True
+                except Exception:
+                    pass
+                
+                try:
+                    # Method 2: PostMessage
+                    ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, IDNO, 0)
+                    time.sleep(0.2)
+                    return True
+                except Exception:
+                    pass
+            
+            return False
+            
+        except Exception as e:
+            self.logger.debug(f"Standard dialog approach failed: {e}")
+            return False
+    
+    def _popup_still_exists(self, hwnd: int) -> bool:
+        """
+        Check if popup window still exists and is visible
+        """
         if not WINDOWS_AVAILABLE:
-            messagebox.showerror("ข้อผิดพลาด", "โปรแกรมนี้ทำงานได้เฉพาะบน Windows เท่านั้น")
-            return
-            
-        if self.is_running:
-            return
+            return False
             
         try:
-            # เริ่ม Popup Blocker
-            self.blocker = PopupBlocker()
-            self.blocker_thread = threading.Thread(target=self._run_blocker, daemon=True)
-            self.blocker_thread.start()
-            
-            # เริ่มป้องกันการล็อคหน้าจอ (ถ้าเลือก)
-            if self.prevent_lock_var.get():
-                if self.mouse_mover.start():
-                    self.add_log("✅ เริ่มป้องกันการล็อคหน้าจอแล้ว")
-                else:
-                    self.add_log("⚠️ ไม่สามารถเริ่มป้องกันการล็อคหน้าจอได้")
-            
-            # อัพเดตสถานะ
-            self.is_running = True
-            self.status_var.set("🟢 กำลังทำงาน...")
-            self.start_button.config(state=tk.DISABLED)
-            self.stop_button.config(state=tk.NORMAL)
-            
-            self.add_log("🚀 เริ่มโปรแกรม Popup Blocker แล้ว (รุ่นปรับปรุง)")
-            self.add_log("🔄 จะคลิกซ้ำจนกว่าปุ่ม 'ไม่' จะหายไป")
-            
-        except Exception as e:
-            messagebox.showerror("ข้อผิดพลาด", f"ไม่สามารถเริ่มโปรแกรมได้: {e}")
-            self.add_log(f"❌ ข้อผิดพลาด: {e}")
+            # ตรวจสอบว่าหน้าต่างยังมองเห็นได้หรือไม่
+            return bool(ctypes.windll.user32.IsWindowVisible(hwnd) and 
+                       ctypes.windll.user32.IsWindow(hwnd))
+        except Exception:
+            return False
     
-    def stop_blocker(self):
-        """หยุดโปรแกรม Popup Blocker"""
-        if not self.is_running:
-            return
-            
-        try:
-            # หยุด Popup Blocker
-            self.is_running = False
-            if self.blocker:
-                self.blocker.stop()
-                
-            # หยุดป้องกันการล็อคหน้าจอ
-            self.mouse_mover.stop()
-            
-            # อัพเดตสถานะ
-            self.status_var.set("🔴 หยุดทำงานแล้ว")
-            self.start_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
-            
-            self.add_log("⏹️ หยุดโปรแกรมแล้ว")
-            
-            # แสดงสถิติสุดท้าย
-            if self.blocker:
-                stats = self.blocker.stats
-                self.update_stats_display(stats)
-                
-        except Exception as e:
-            self.add_log(f"❌ ข้อผิดพลาดในการหยุดโปรแกรม: {e}")
-    
-    def _run_blocker(self):
-        """รัน Popup Blocker ในเธรดแยก"""
-        try:
-            while self.is_running and self.blocker:
-                # ตรวจสอบ popup
-                self.blocker._check_for_popups()
-                
-                # อัพเดตสถิติ
-                self.root.after(0, self.update_stats_display, self.blocker.stats.copy())
-                
-                # รอตามการตั้งค่า
-                time.sleep(self.blocker.config.check_interval)
-                
-        except Exception as e:
-            self.root.after(0, self.add_log, f"❌ ข้อผิดพลาดในการทำงาน: {e}")
-    
-    def update_stats_display(self, stats):
-        """อัพเดตการแสดงสถิติ"""
-        stats_text = f"Popup ที่พบ: {stats['popups_detected']} | กดปุ่มแล้ว: {stats['buttons_clicked']} | ข้อผิดพลาด: {stats['errors']}"
-        self.stats_text.config(text=stats_text)
-    
-    def on_closing(self):
-        """เมื่อปิดโปรแกรม"""
-        if self.is_running:
-            self.stop_blocker()
+    def _print_stats(self):
+        """Print statistics about the session"""
+        self.logger.info("=== Session Statistics ===")
+        self.logger.info(f"Popups detected: {self.stats['popups_detected']}")
+        self.logger.info(f"Buttons clicked: {self.stats['buttons_clicked']}")
+        self.logger.info(f"Errors encountered: {self.stats['errors']}")
         
-        # รอให้เธรดจบ
-        if self.blocker_thread and self.blocker_thread.is_alive():
-            self.blocker_thread.join(timeout=2)
-            
-        self.root.destroy()
-    
-    def run(self):
-        """เริ่มรัน GUI"""
-        self.root.mainloop()
+        if self.stats['popups_detected'] > 0:
+            success_rate = (self.stats['buttons_clicked'] / self.stats['popups_detected']) * 100
+            self.logger.info(f"Success rate: {success_rate:.1f}%")
 
 def main():
-    """ฟังก์ชันหลัก"""
+    """Main entry point"""
+    if not WINDOWS_AVAILABLE:
+        print("Error: This program only works on Windows")
+        print("ข้อผิดพลาด: โปรแกรมนี้ทำงานได้เฉพาะบน Windows เท่านั้น")
+        sys.exit(1)
+    
+    print("Popup Blocker - Automatic 'No' Button Clicker")
+    print("=" * 50)
+    print("Press Ctrl+C to stop")
+    print()
+    
+    blocker = PopupBlocker()
+    
     try:
-        # สร้าง GUI และรัน
-        app = PopupBlockerGUI()
-        app.run()
-        
+        blocker.start()
     except Exception as e:
-        print(f"ข้อผิดพลาดใน GUI: {e}")
-        
-        # ถ้า GUI ไม่ทำงาน ให้ใช้แบบ console
-        if WINDOWS_AVAILABLE:
-            from popup_blocker import main as console_main
-            print("เปลี่ยนไปใช้ console mode...")
-            console_main()
-        else:
-            print("ไม่สามารถรันโปรแกรมได้ - ต้องการ Windows")
+        print(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
