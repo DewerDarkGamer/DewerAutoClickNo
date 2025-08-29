@@ -82,7 +82,7 @@ class MouseMover:
         try:
             while self.running:
                 # รอ 4 นาที (240 วินาที) ตามที่ผู้ใช้ต้องการ
-                for i in range(240):
+                for i in range(1):
                     if not self.running:
                         return
                     time.sleep(1)
